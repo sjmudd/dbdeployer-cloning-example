@@ -1,0 +1,161 @@
+#!/bin/sh
+#
+# Copyright (c) 2019, Simon J Mudd <sjmudd@pobox.com>
+# All rights reserved.
+# 
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+# 
+# * Redistributions of source code must retain the above copyright notice, this
+#   list of conditions and the following disclaimer.
+# 
+# * Redistributions in binary form must reproduce the above copyright notice,
+#   this list of conditions and the following disclaimer in the documentation
+#   and/or other materials provided with the distribution.
+# 
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+# Clone test script for MySQL 8.0.17+ to be used with dbdeployer.
+#
+# This will spin up 2 MySQL instances, populate one with data
+# and then clone the data to the other one. We'll break the second
+# box and clone it again, and finally break the first box, cloning
+# from the second one.
+#
+# Using GTID here so we can verify that db contents on both boxes
+# are the same.
+
+set -e
+
+cleanup () {
+	local rc=$?
+
+	if [ $rc != 0 ]; then
+		msg "Script failed, returning $rc"
+	else
+		msg "Script completed successfully"
+	fi
+}
+
+msg () {
+	echo "[$(date +%H:%M:%S)] ==> $@"
+}
+
+clone_instance () {
+	local db_user="$1"
+	local server_port="$2"
+	local db_pass="$3"
+
+	echo "CLONE INSTANCE FROM $db_user@127.0.0.1:$server_port IDENTIFIED BY '$db_pass'"
+}
+
+# get the state for the given $use value
+get_clone_state () {
+	local use="$1"
+
+	# return state from the p_s table. Only works on the destination box.
+
+	$use -BNe "SELECT state FROM performance_schema.clone_status" 2>/dev/null || true
+}
+
+# Wait up to $sleep_delay for server to come up after cloning completes.
+# - we need the server to be up, reachable, and the clone process to be signalled as completed
+# - convert the "use" setting to a "status" setting
+wait_for_clone_completion () {
+	local use="$1"
+	local sleep_delay="$2"
+	local count=0
+	local wanted_state=Completed
+	local current_state=$(get_clone_state "$use")
+	# msg "current_state: $current_state"
+	while [ "$current_state" != $wanted_state ]; do
+		sleep 1
+		count=$(($count + 1))
+		if [ $count != $sleep_delay ]; then
+			current_state=$(get_clone_state "$use")
+			# msg "current_state: $current_state"
+		fi
+	done
+	if [ "$current_state" != $wanted_state ]; then
+		msg "wait_for_clone_completion $use failed after $sleep_delay second(s). current_state: '$current_state', expecting '$wanted_state'"
+		exit 1
+	fi
+}
+
+trap cleanup 0 1 2 3 9 15
+
+sleep_delay=10
+db_user=db_user
+db_pass=db_pass
+mysql_version=8.0.17
+server1=~/sandboxes/server1_8_0_17/use
+server1_port=18001
+server2=~/sandboxes/server2_8_0_17/use
+server2_port=18002
+show_gtid_executed="select @@global.port, @@global.gtid_executed"
+common_config="--master --db-password=$db_pass --db-user=$db_user --gtid --enable-general-log"
+install_clone_plugin="install plugin clone soname 'mysql_clone.so'"
+
+msg "server1 has port $server1_port, server2 has port $server2_port, gtid_mode: ON"
+
+# To cleanup if you have an existing setup do something like the following:
+# (make sure this doesn't break servers you want to keep running)
+# $ pkill -af bin/mysqld
+# $ rm -rf ~/sandboxes/server1_8_0_17/ ~/sandboxes/server2_8_0_17/
+
+msg "building empty server1"
+dbdeployer deploy single $mysql_version --sandbox-directory=server1_8_0_17 --port=$server1_port $common_config
+msg "building empty server2"
+dbdeployer deploy single $mysql_version --sandbox-directory=server2_8_0_17 --port=$server2_port $common_config
+
+# Change to the directory containing test_db (https://github.com/datacharmer/test_db)
+cd ~/data/employees
+
+msg "populating server1 with data"
+$server1 -e "$install_clone_plugin"
+$server1 < employees.sql
+$server1 -e "$show_gtid_executed"
+
+msg "cloning server2 from server1"
+$server2 -e "$install_clone_plugin"
+$server2 -e "set persist clone_valid_donor_list='127.0.0.1:$server1_port'"
+$server2 -e "$(clone_instance $db_user $server1_port $db_pass)"
+wait_for_clone_completion "$server2" $sleep_delay
+$server2 -e "$show_gtid_executed"
+
+msg "dropping some tables on server2 (by mistake)"
+for t in titles salaries dept_manager dept_emp departments employees; do
+	msg "- $t "
+	$server2 -e "drop table $t" employees
+done
+$server2 -e "$show_gtid_executed"
+
+msg "cloning server2 again from server1"
+$server2 -e "$(clone_instance $db_user $server1_port $db_pass)"
+wait_for_clone_completion "$server2" $sleep_delay
+$server2 -e "$show_gtid_executed"
+
+msg "dropping employee db on server1 (by mistake)"
+$server1 -e "drop database employees"
+$server1 -e "$show_gtid_executed"
+
+msg "add some local data to server2"
+$server2 -e "insert into employees values ( 9990, '1900-01-01', 'Simon', 'Mudd', 'M', '1950-01-01' )" employees
+$server2 -e "insert into departments values ( 'd010', 'IT' )" employees
+$server2 -e "insert into dept_emp values ( 9990, 'd010', '1950-01-01', '1960-01-01' )" employees
+$server2 -e "$show_gtid_executed"
+
+msg "cloning server1 from server2"
+$server1 -e "set persist clone_valid_donor_list='127.0.0.1:$server2_port'"
+$server1 -e "$(clone_instance $db_user $server2_port $db_pass)"
+wait_for_clone_completion "$server1" $sleep_delay
+$server1 -e "$show_gtid_executed"
